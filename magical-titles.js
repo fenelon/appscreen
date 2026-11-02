@@ -264,10 +264,13 @@ function showMagicalTitlesDialog() {
 
     // Populate language dropdown
     const langSelect = document.getElementById('magical-titles-language');
-    langSelect.innerHTML = state.projectLanguages.map(lang => {
-        const langName = languageNames[lang] || lang;
-        return `<option value="${lang}">${langName}</option>`;
-    }).join('');
+    langSelect.replaceChildren();
+    state.projectLanguages.forEach(lang => {
+        const option = document.createElement('option');
+        option.value = lang;
+        option.textContent = languageNames[lang] || lang;
+        langSelect.appendChild(option);
+    });
 
     // Show modal
     document.getElementById('magical-titles-modal').classList.add('visible');
