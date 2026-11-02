@@ -1260,6 +1260,10 @@ const deviceDimensions = {
     'web-feature': { width: 1024, height: 500 }
 };
 
+function isValidOutputDevice(value) {
+    return value === 'custom' || (typeof value === 'string' && Object.prototype.hasOwnProperty.call(deviceDimensions, value));
+}
+
 // DOM elements
 const canvas = document.getElementById('preview-canvas');
 const ctx = canvas.getContext('2d');
@@ -1447,10 +1451,13 @@ function updateProjectSelector() {
 
         const screenshotCount = project.id === currentProjectId ? state.screenshots.length : (project.screenshotCount || 0);
 
-        option.innerHTML = `
-            <span class="project-option-name">${project.name}</span>
-            <span class="project-option-meta">${screenshotCount} screenshot${screenshotCount !== 1 ? 's' : ''}</span>
-        `;
+        const name = document.createElement('span');
+        name.className = 'project-option-name';
+        name.textContent = project.name;
+        const meta = document.createElement('span');
+        meta.className = 'project-option-meta';
+        meta.textContent = `${screenshotCount} screenshot${screenshotCount !== 1 ? 's' : ''}`;
+        option.append(name, meta);
 
         option.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -1469,7 +1476,10 @@ async function init() {
     try {
         await openDatabase();
         await loadProjectsMeta();
-        await loadState();
+        const pendingLoad = loadState();
+        const loadGeneration = projectLoadGeneration;
+        await pendingLoad;
+        if (loadGeneration !== projectLoadGeneration) return;
         syncUIWithState();
         updateCanvas();
     } catch (e) {
@@ -1495,6 +1505,11 @@ function initSync() {
 
 // Save state to IndexedDB for current project
 // Build a serializable version of the current state (no HTMLImageElement objects)
+let isLoadingProject = false;
+let projectLoadGeneration = 0;
+let cancelActiveProjectLoad = null;
+let activeProjectLoad = null;
+let projectSwitchQueue = Promise.resolve();
 function serializeState() {
     const screenshotsToSave = state.screenshots.map(s => {
         const localizedImages = {};
@@ -1553,7 +1568,7 @@ function serializeState() {
 }
 
 function saveState() {
-    if (!db) return;
+    if (!db || isLoadingProject) return;
 
     const stateToSave = serializeState();
 
@@ -1593,7 +1608,7 @@ function migrate3DPosition(screenshotSettings) {
 }
 
 // Reconstruct Image objects for graphic/icon elements from saved data
-function reconstructElementImages(elements) {
+function reconstructElementImages(elements, isCurrent = () => true) {
     if (!elements || !Array.isArray(elements)) return [];
     return elements.map(el => {
         const restored = { ...el };
@@ -1605,6 +1620,7 @@ function reconstructElementImages(elements) {
             // Async fetch; image will be null initially, then updateCanvas() when ready
             getLucideImage(el.iconName, el.iconColor || '#ffffff', el.iconStrokeWidth || 2)
                 .then(img => {
+                    if (!isCurrent()) return;
                     restored.image = img;
                     updateCanvas();
                 })
@@ -1617,20 +1633,82 @@ function reconstructElementImages(elements) {
 // Load state from IndexedDB for current project
 function loadState() {
     if (!db) return Promise.resolve();
+    if (cancelActiveProjectLoad) cancelActiveProjectLoad();
+    const loadGeneration = ++projectLoadGeneration;
+    const projectId = currentProjectId;
+    isLoadingProject = true;
+    document.body.inert = true;
 
-    return new Promise((resolve) => {
+    const pendingLoad = new Promise((resolve) => {
+        let settled = false;
+        const isCurrentLoad = () => loadGeneration === projectLoadGeneration && currentProjectId === projectId;
+        const stopLoading = () => {
+            if (!isCurrentLoad()) return;
+            isLoadingProject = false;
+            document.body.inert = false;
+        };
+        const settle = () => {
+            if (settled) return;
+            settled = true;
+            if (cancelActiveProjectLoad === settle) cancelActiveProjectLoad = null;
+            resolve();
+        };
+        cancelActiveProjectLoad = settle;
         try {
             const transaction = db.transaction([PROJECTS_STORE], 'readonly');
             const store = transaction.objectStore(PROJECTS_STORE);
-            const request = store.get(currentProjectId);
+            const request = store.get(projectId);
 
             request.onsuccess = () => {
+                if (!isCurrentLoad()) return settle();
                 const parsed = request.result;
                 if (parsed) {
+                    // Older imports may already contain null entries. Ignore them while loading.
+                    const savedScreenshots = Array.isArray(parsed.screenshots)
+                        ? parsed.screenshots.filter(s => s && typeof s === 'object' && !Array.isArray(s))
+                        : [];
                     // Check if this is an old-style project (no per-screenshot settings)
                     const isOldFormat = !parsed.defaults && (parsed.background || parsed.screenshot || parsed.text);
-                    const hasScreenshotsWithoutSettings = parsed.screenshots?.some(s => !s.background && !s.screenshot && !s.text);
+                    const hasScreenshotsWithoutSettings = savedScreenshots.some(s => !s.background && !s.screenshot && !s.text);
                     const needsMigration = isOldFormat || hasScreenshotsWithoutSettings;
+                    let allScreenshotsLoaded = savedScreenshots.length === 0;
+                    let stateConfigured = false;
+                    let finished = false;
+                    const finishLoad = () => {
+                        if (!isCurrentLoad()) return settle();
+                        if (!allScreenshotsLoaded || !stateConfigured || finished) return;
+                        finished = true;
+                        stopLoading();
+                        try {
+                            updateScreenshotList();
+                            syncUIWithState();
+                            updateGradientStopsUI();
+                            updateCanvas();
+                            if (needsMigration && savedScreenshots.length > 0) showMigrationPrompt();
+                        } catch (error) {
+                            console.error('Error rendering project:', error);
+                        } finally {
+                            settle();
+                        }
+                    };
+                    const loadScreenshotImage = (src, onLoad, onFailure) => {
+                        const image = new Image();
+                        let completed = false;
+                        const finishImage = callback => {
+                            if (completed) return;
+                            completed = true;
+                            clearTimeout(timeout);
+                            if (isCurrentLoad()) callback(image);
+                        };
+                        const timeout = setTimeout(() => finishImage(onFailure), 15000);
+                        image.onload = () => finishImage(onLoad);
+                        image.onerror = () => finishImage(onFailure);
+                        try {
+                            image.src = src;
+                        } catch {
+                            finishImage(onFailure);
+                        }
+                    };
 
                     // Check if we need to migrate 3D positions (formatVersion < 2)
                     const needs3DMigration = !parsed.formatVersion || parsed.formatVersion < 2;
@@ -1666,11 +1744,11 @@ function loadState() {
                         }
                     }
 
-                    if (parsed.screenshots && parsed.screenshots.length > 0) {
+                    if (savedScreenshots.length > 0) {
                         let loadedCount = 0;
-                        const totalToLoad = parsed.screenshots.length;
+                        const totalToLoad = savedScreenshots.length;
 
-                        parsed.screenshots.forEach((s, index) => {
+                        savedScreenshots.forEach((s, index) => {
                             // Check if we have new localized format or old single-image format
                             const hasLocalizedImages = s.localizedImages && Object.keys(s.localizedImages).length > 0;
 
@@ -1689,7 +1767,7 @@ function loadState() {
                                     background: bgData,
                                     screenshot: screenshotSettings,
                                     text: s.text || JSON.parse(JSON.stringify(migratedText)),
-                                    elements: reconstructElementImages(s.elements),
+                                    elements: reconstructElementImages(s.elements, isCurrentLoad),
                                     popouts: s.popouts || [],
                                     overrides: s.overrides || {}
                                 };
@@ -1697,6 +1775,7 @@ function loadState() {
                                 if (bgData.imageSrc) {
                                     const bgImg = new Image();
                                     bgImg.onload = () => {
+                                        if (!isCurrentLoad()) return;
                                         bgData.image = bgImg;
                                         updateCanvas();
                                     };
@@ -1710,97 +1789,30 @@ function loadState() {
                                 let langLoadedCount = 0;
                                 const localizedImages = {};
 
-                                langKeys.forEach(lang => {
-                                    const langData = s.localizedImages[lang];
-                                    if (langData?.src) {
-                                        const langImg = new Image();
-                                        langImg.onload = () => {
-                                            localizedImages[lang] = {
-                                                image: langImg,
-                                                src: langData.src,
-                                                name: langData.name || s.name
-                                            };
-                                            langLoadedCount++;
-
-                                            if (langLoadedCount === langKeys.length) {
-                                                // All language versions loaded
-                                                const firstLang = langKeys[0];
-                                                const screenshotSettings = s.screenshot || JSON.parse(JSON.stringify(migratedScreenshot));
-                                                if (needs3DMigration) {
-                                                    migrate3DPosition(screenshotSettings);
-                                                }
-                                                const bgData = s.background || JSON.parse(JSON.stringify(migratedBackground));
-                                                state.screenshots[index] = {
-                                                    image: localizedImages[firstLang]?.image, // Legacy compat
-                                                    name: s.name,
-                                                    deviceType: s.deviceType,
-                                                    localizedImages: localizedImages,
-                                                    background: bgData,
-                                                    screenshot: screenshotSettings,
-                                                    text: s.text || JSON.parse(JSON.stringify(migratedText)),
-                                                    elements: reconstructElementImages(s.elements),
-                                                    popouts: s.popouts || [],
-                                                    overrides: s.overrides || {}
-                                                };
-                                                // Reconstruct background Image from saved data URL
-                                                if (bgData.imageSrc) {
-                                                    const bgImg = new Image();
-                                                    bgImg.onload = () => {
-                                                        bgData.image = bgImg;
-                                                        updateCanvas();
-                                                    };
-                                                    bgImg.src = bgData.imageSrc;
-                                                }
-                                                loadedCount++;
-                                                checkAllLoaded();
-                                            }
-                                        };
-                                        langImg.src = langData.src;
-                                    } else {
-                                        langLoadedCount++;
-                                        if (langLoadedCount === langKeys.length) {
-                                            loadedCount++;
-                                            checkAllLoaded();
-                                        }
-                                    }
-                                });
-                            } else {
-                                // Old format: migrate to localized images
-                                const img = new Image();
-                                img.onload = () => {
-                                    // Detect language from filename, default to 'en'
-                                    const detectedLang = typeof detectLanguageFromFilename === 'function'
-                                        ? detectLanguageFromFilename(s.name || '')
-                                        : 'en';
-
-                                    const localizedImages = {};
-                                    localizedImages[detectedLang] = {
-                                        image: img,
-                                        src: s.src,
-                                        name: s.name
-                                    };
-
+                                const finishLocalizedScreenshot = () => {
+                                    if (langLoadedCount !== langKeys.length) return;
+                                    const firstImage = Object.values(localizedImages).find(data => data.image)?.image || null;
                                     const screenshotSettings = s.screenshot || JSON.parse(JSON.stringify(migratedScreenshot));
                                     if (needs3DMigration) {
                                         migrate3DPosition(screenshotSettings);
                                     }
                                     const bgData = s.background || JSON.parse(JSON.stringify(migratedBackground));
                                     state.screenshots[index] = {
-                                        image: img,
-                                        name: s.name,
+                                        image: firstImage, // Legacy compat; null when stored image data is invalid
+                                        name: s.name || 'Blank Screen',
                                         deviceType: s.deviceType,
-                                        localizedImages: localizedImages,
+                                        localizedImages,
                                         background: bgData,
                                         screenshot: screenshotSettings,
                                         text: s.text || JSON.parse(JSON.stringify(migratedText)),
-                                        elements: reconstructElementImages(s.elements),
+                                        elements: reconstructElementImages(s.elements, isCurrentLoad),
                                         popouts: s.popouts || [],
                                         overrides: s.overrides || {}
                                     };
-                                    // Reconstruct background Image from saved data URL
                                     if (bgData.imageSrc) {
                                         const bgImg = new Image();
                                         bgImg.onload = () => {
+                                            if (!isCurrentLoad()) return;
                                             bgData.image = bgImg;
                                             updateCanvas();
                                         };
@@ -1809,32 +1821,91 @@ function loadState() {
                                     loadedCount++;
                                     checkAllLoaded();
                                 };
-                                img.src = s.src;
+
+                                langKeys.forEach(lang => {
+                                    const langData = s.localizedImages[lang];
+                                    if (langData?.src) {
+                                        loadScreenshotImage(langData.src, langImg => {
+                                            localizedImages[lang] = {
+                                                image: langImg,
+                                                src: langData.src,
+                                                name: langData.name || s.name
+                                            };
+                                            langLoadedCount++;
+                                            finishLocalizedScreenshot();
+                                        }, () => {
+                                            localizedImages[lang] = {
+                                                image: null,
+                                                src: langData.src,
+                                                name: langData.name || s.name
+                                            };
+                                            langLoadedCount++;
+                                            finishLocalizedScreenshot();
+                                        });
+                                    } else {
+                                        langLoadedCount++;
+                                        finishLocalizedScreenshot();
+                                    }
+                                });
+                            } else {
+                                // Old format: migrate to localized images
+                                const finishLegacyScreenshot = (loadedImage) => {
+                                    const localizedImages = {};
+                                    if (s.src) {
+                                        const detectedLang = typeof detectLanguageFromFilename === 'function'
+                                            ? detectLanguageFromFilename(s.name || '')
+                                            : 'en';
+                                        localizedImages[detectedLang] = {
+                                            image: loadedImage,
+                                            src: s.src,
+                                            name: s.name
+                                        };
+                                    }
+
+                                    const screenshotSettings = s.screenshot || JSON.parse(JSON.stringify(migratedScreenshot));
+                                    if (needs3DMigration) {
+                                        migrate3DPosition(screenshotSettings);
+                                    }
+                                    const bgData = s.background || JSON.parse(JSON.stringify(migratedBackground));
+                                    state.screenshots[index] = {
+                                        image: loadedImage,
+                                        name: s.name || 'Blank Screen',
+                                        deviceType: s.deviceType,
+                                        localizedImages: localizedImages,
+                                        background: bgData,
+                                        screenshot: screenshotSettings,
+                                        text: s.text || JSON.parse(JSON.stringify(migratedText)),
+                                        elements: reconstructElementImages(s.elements, isCurrentLoad),
+                                        popouts: s.popouts || [],
+                                        overrides: s.overrides || {}
+                                    };
+                                    // Reconstruct background Image from saved data URL
+                                    if (bgData.imageSrc) {
+                                        const bgImg = new Image();
+                                        bgImg.onload = () => {
+                                            if (!isCurrentLoad()) return;
+                                            bgData.image = bgImg;
+                                            updateCanvas();
+                                        };
+                                        bgImg.src = bgData.imageSrc;
+                                    }
+                                    loadedCount++;
+                                    checkAllLoaded();
+                                };
+                                loadScreenshotImage(s.src, finishLegacyScreenshot, () => finishLegacyScreenshot(null));
                             }
                         });
 
                         function checkAllLoaded() {
                             if (loadedCount === totalToLoad) {
-                                updateScreenshotList();
-                                syncUIWithState();
-                                updateGradientStopsUI();
-                                updateCanvas();
-
-                                if (needsMigration && parsed.screenshots.length > 0) {
-                                    showMigrationPrompt();
-                                }
+                                allScreenshotsLoaded = true;
+                                finishLoad();
                             }
                         }
-                    } else {
-                        // No screenshots - still need to update UI
-                        updateScreenshotList();
-                        syncUIWithState();
-                        updateGradientStopsUI();
-                        updateCanvas();
                     }
 
-                    state.selectedIndex = parsed.selectedIndex || 0;
-                    state.outputDevice = parsed.outputDevice || 'iphone-6.9';
+                    state.selectedIndex = Math.min(Math.max(Number(parsed.selectedIndex) || 0, 0), Math.max(savedScreenshots.length - 1, 0));
+                    state.outputDevice = isValidOutputDevice(parsed.outputDevice) ? parsed.outputDevice : 'iphone-6.9';
                     state.customWidth = parsed.customWidth || 1320;
                     state.customHeight = parsed.customHeight || 2868;
 
@@ -1851,6 +1922,7 @@ function loadState() {
                         if (state.defaults.background?.imageSrc) {
                             const defBgImg = new Image();
                             defBgImg.onload = () => {
+                                if (!isCurrentLoad()) return;
                                 state.defaults.background.image = defBgImg;
                             };
                             defBgImg.src = state.defaults.background.imageSrc;
@@ -1860,23 +1932,34 @@ function loadState() {
                         state.defaults.screenshot = migratedScreenshot;
                         state.defaults.text = migratedText;
                     }
+                    stateConfigured = true;
+                    finishLoad();
                 } else {
                     // New project, reset to defaults
                     resetStateToDefaults();
                     updateScreenshotList();
+                    stopLoading();
+                    settle();
                 }
-                resolve();
             };
 
             request.onerror = () => {
+                if (!isCurrentLoad()) return settle();
                 console.error('Error loading state:', request.error);
-                resolve();
+                stopLoading();
+                settle();
             };
         } catch (e) {
             console.error('Error loading state:', e);
-            resolve();
+            stopLoading();
+            settle();
         }
     });
+    activeProjectLoad = pendingLoad;
+    void pendingLoad.finally(() => {
+        if (activeProjectLoad === pendingLoad) activeProjectLoad = null;
+    });
+    return pendingLoad;
 }
 
 // Show migration prompt for old-style projects
@@ -1993,22 +2076,29 @@ function resetStateToDefaults() {
 }
 
 // Switch to a different project
-async function switchProject(projectId) {
-    // Save current project first
-    saveState();
+function switchProject(projectId) {
+    const operation = projectSwitchQueue.then(async () => {
+        if (activeProjectLoad) await activeProjectLoad;
+        // Save current project only after its images have finished loading.
+        saveState();
 
-    currentProjectId = projectId;
-    saveProjectsMeta();
+        currentProjectId = projectId;
+        saveProjectsMeta();
 
-    // Reset and load new project
-    resetStateToDefaults();
-    await loadState();
+        resetStateToDefaults();
+        const pendingLoad = loadState();
+        const loadGeneration = projectLoadGeneration;
+        await pendingLoad;
+        if (loadGeneration !== projectLoadGeneration || currentProjectId !== projectId) return;
 
-    syncUIWithState();
-    updateScreenshotList();
-    updateGradientStopsUI();
-    updateProjectSelector();
-    updateCanvas();
+        syncUIWithState();
+        updateScreenshotList();
+        updateGradientStopsUI();
+        updateProjectSelector();
+        updateCanvas();
+    });
+    projectSwitchQueue = operation.catch(() => {});
+    return operation;
 }
 
 // Create a new project
@@ -2131,8 +2221,24 @@ async function handleProjectImport(file) {
         const data = JSON.parse(text);
 
         // Validate structure
-        if (!data.screenshots || !Array.isArray(data.screenshots)) {
-            await showAppAlert('Invalid project file: missing screenshots data', 'error');
+        if (!Array.isArray(data.screenshots) || !data.screenshots.every(s => s && typeof s === 'object' && !Array.isArray(s))) {
+            await showAppAlert('Invalid project file: screenshots must be objects', 'error');
+            return;
+        }
+        if (!data.screenshots.every(s => s.localizedImages == null ||
+            (typeof s.localizedImages === 'object' && !Array.isArray(s.localizedImages) &&
+                Object.values(s.localizedImages).every(image => image && typeof image === 'object' &&
+                    typeof image.src === 'string' && image.src.length > 0)))) {
+            await showAppAlert('Invalid project file: localized images need a source', 'error');
+            return;
+        }
+        if (data.projectLanguages !== undefined &&
+            (!Array.isArray(data.projectLanguages) || !data.projectLanguages.every(lang => typeof lang === 'string'))) {
+            await showAppAlert('Invalid project file: languages must be strings', 'error');
+            return;
+        }
+        if (data.outputDevice !== undefined && !isValidOutputDevice(data.outputDevice)) {
+            await showAppAlert('Invalid project file: unknown output device', 'error');
             return;
         }
 
@@ -2141,7 +2247,8 @@ async function handleProjectImport(file) {
 
         // Create new project
         const newId = 'project_' + Date.now();
-        const projectName = data.projectName || file.name.replace(/\.appscreen$|\.json$/, '') || 'Imported Project';
+        const projectName = (typeof data.projectName === 'string' && data.projectName.trim())
+            || file.name.replace(/\.appscreen$|\.json$/, '') || 'Imported Project';
 
         // Clean the data for IndexedDB storage
         data.id = newId;
@@ -2508,24 +2615,11 @@ function updateElementsList() {
             'above-text': 'Front'
         };
 
-        let thumbContent;
-        if (el.type === 'graphic' && el.image) {
-            thumbContent = `<img src="${el.image.src}" alt="${el.name}">`;
-        } else if (el.type === 'emoji') {
-            thumbContent = `<span class="emoji-thumb">${el.emoji}</span>`;
-        } else if (el.type === 'icon' && el.image) {
-            thumbContent = `<img src="${el.image.src}" alt="${el.name}" style="padding: 4px; filter: var(--icon-thumb-filter, none);">`;
-        } else {
-            thumbContent = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/>
-            </svg>`;
-        }
-
         item.innerHTML = `
-            <div class="element-item-thumb">${thumbContent}</div>
+            <div class="element-item-thumb"></div>
             <div class="element-item-info">
-                <div class="element-item-name">${el.type === 'text' ? (getElementText(el) || 'Text') : el.type === 'emoji' ? `${el.emoji} ${el.name}` : el.name}</div>
-                <div class="element-item-layer">${layerLabels[el.layer] || el.layer}</div>
+                <div class="element-item-name"></div>
+                <div class="element-item-layer"></div>
             </div>
             <div class="element-item-actions">
                 <button class="element-item-btn" data-action="move-up" title="Move up">
@@ -2545,6 +2639,28 @@ function updateElementsList() {
                 </button>
             </div>
         `;
+        const thumb = item.querySelector('.element-item-thumb');
+        if ((el.type === 'graphic' || el.type === 'icon') && el.image) {
+            const image = document.createElement('img');
+            image.src = el.image.src;
+            image.alt = el.name || '';
+            if (el.type === 'icon') {
+                image.style.padding = '4px';
+                image.style.filter = 'var(--icon-thumb-filter, none)';
+            }
+            thumb.appendChild(image);
+        } else if (el.type === 'emoji') {
+            const emoji = document.createElement('span');
+            emoji.className = 'emoji-thumb';
+            emoji.textContent = el.emoji || '';
+            thumb.appendChild(emoji);
+        } else {
+            thumb.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>';
+        }
+        item.querySelector('.element-item-name').textContent = el.type === 'text'
+            ? (getElementText(el) || 'Text')
+            : el.type === 'emoji' ? `${el.emoji} ${el.name}` : (el.name || '');
+        item.querySelector('.element-item-layer').textContent = layerLabels[el.layer] || el.layer || '';
 
         // Click to select
         item.addEventListener('click', (e) => {
@@ -4830,7 +4946,10 @@ function updateLanguageMenu() {
     state.projectLanguages.forEach(lang => {
         const btn = document.createElement('button');
         btn.className = 'language-menu-item' + (lang === state.currentLanguage ? ' active' : '');
-        btn.innerHTML = `<span class="flag">${languageFlags[lang] || '🏳️'}</span> ${languageNames[lang] || lang.toUpperCase()}`;
+        const flag = document.createElement('span');
+        flag.className = 'flag';
+        flag.textContent = languageFlags[lang] || '🏳️';
+        btn.append(flag, document.createTextNode(` ${languageNames[lang] || lang.toUpperCase()}`));
         btn.onclick = () => {
             switchGlobalLanguage(lang);
             document.getElementById('language-menu').classList.remove('visible');
@@ -4886,8 +5005,8 @@ function updateLanguagesList() {
         const isOnly = state.projectLanguages.length === 1;
 
         item.innerHTML = `
-            <span class="flag">${flag}</span>
-            <span class="name">${name}</span>
+            <span class="flag"></span>
+            <span class="name"></span>
             ${isCurrent ? '<span class="current-badge">Current</span>' : ''}
             <button class="remove-btn" ${isOnly ? 'disabled' : ''} title="${isOnly ? 'Cannot remove the only language' : 'Remove language'}">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -4895,6 +5014,8 @@ function updateLanguagesList() {
                 </svg>
             </button>
         `;
+        item.querySelector('.flag').textContent = flag;
+        item.querySelector('.name').textContent = name;
 
         const removeBtn = item.querySelector('.remove-btn');
         if (!isOnly) {
@@ -5160,11 +5281,16 @@ function openTranslateModal(target) {
         item.dataset.lang = lang;
         item.innerHTML = `
             <div class="translate-target-header">
-                <span class="flag">${languageFlags[lang]}</span>
-                <span>${languageNames[lang] || lang}</span>
+                <span class="flag"></span>
+                <span class="translate-target-name"></span>
             </div>
-            <textarea placeholder="Enter ${languageNames[lang] || lang} translation...">${texts[lang] || ''}</textarea>
+            <textarea></textarea>
         `;
+        item.querySelector('.flag').textContent = languageFlags[lang] || '🏳️';
+        item.querySelector('.translate-target-name').textContent = languageNames[lang] || lang;
+        const textarea = item.querySelector('textarea');
+        textarea.placeholder = `Enter ${languageNames[lang] || lang} translation...`;
+        textarea.value = texts[lang] || '';
         targetsContainer.appendChild(item);
     });
 
@@ -5389,12 +5515,13 @@ function showAppAlert(message, type = 'info') {
                         ${iconPath}
                     </svg>
                 </div>
-                <p class="modal-message" style="margin: 16px 0;">${message}</p>
+                <p class="modal-message" style="margin: 16px 0;"></p>
                 <div class="modal-buttons">
                     <button class="modal-btn modal-btn-confirm" style="background: var(--accent);">OK</button>
                 </div>
             </div>
         `;
+        overlay.querySelector('.modal-message').textContent = message;
         document.body.appendChild(overlay);
 
         const okBtn = overlay.querySelector('.modal-btn-confirm');
@@ -5421,13 +5548,16 @@ function showAppConfirm(message, confirmText = 'Confirm', cancelText = 'Cancel')
                         <path d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
                     </svg>
                 </div>
-                <p class="modal-message" style="margin: 16px 0; white-space: pre-line;">${message}</p>
+                <p class="modal-message" style="margin: 16px 0; white-space: pre-line;"></p>
                 <div class="modal-buttons">
-                    <button class="modal-btn modal-btn-cancel">${cancelText}</button>
-                    <button class="modal-btn modal-btn-confirm" style="background: var(--accent);">${confirmText}</button>
+                    <button class="modal-btn modal-btn-cancel"></button>
+                    <button class="modal-btn modal-btn-confirm" style="background: var(--accent);"></button>
                 </div>
             </div>
         `;
+        overlay.querySelector('.modal-message').textContent = message;
+        overlay.querySelector('.modal-btn-cancel').textContent = cancelText;
+        overlay.querySelector('.modal-btn-confirm').textContent = confirmText;
         document.body.appendChild(overlay);
 
         const confirmBtn = overlay.querySelector('.modal-btn-confirm');
@@ -5459,14 +5589,6 @@ function showTranslateConfirmDialog(providerName) {
         // Default to first project language
         const defaultLang = state.projectLanguages[0] || 'en';
 
-        // Build language options
-        const languageOptions = state.projectLanguages.map(lang => {
-            const flag = languageFlags[lang] || '🏳️';
-            const name = languageNames[lang] || lang.toUpperCase();
-            const selected = lang === defaultLang ? 'selected' : '';
-            return `<option value="${lang}" ${selected}>${flag} ${name}</option>`;
-        }).join('');
-
         // Count texts for each language
         const getTextCount = (lang) => {
             let count = 0;
@@ -5494,7 +5616,6 @@ function showTranslateConfirmDialog(providerName) {
                 <div style="margin-bottom: 16px;">
                     <label style="display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px;">Source Language</label>
                     <select id="translate-source-lang" style="width: 100%; padding: 10px 12px; background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); font-size: 14px; cursor: pointer;">
-                        ${languageOptions}
                     </select>
                 </div>
 
@@ -5519,6 +5640,14 @@ function showTranslateConfirmDialog(providerName) {
                 </div>
             </div>
         `;
+        const sourceSelect = overlay.querySelector('#translate-source-lang');
+        state.projectLanguages.forEach(lang => {
+            const option = document.createElement('option');
+            option.value = lang;
+            option.textContent = `${languageFlags[lang] || '🏳️'} ${languageNames[lang] || lang.toUpperCase()}`;
+            option.selected = lang === defaultLang;
+            sourceSelect.appendChild(option);
+        });
 
         document.body.appendChild(overlay);
 
@@ -6439,20 +6568,13 @@ function updateScreenshotList() {
         // Build language flags indicator
         const availableLangs = getAvailableLanguagesForScreenshot(screenshot);
         const isComplete = isScreenshotComplete(screenshot);
-        let langFlagsHtml = '';
-        if (state.projectLanguages.length > 1) {
-            const flags = availableLangs.map(lang => languageFlags[lang] || '🏳️').join('');
-            const checkmark = isComplete ? '<span class="screenshot-complete">✓</span>' : '';
-            langFlagsHtml = `<span class="screenshot-lang-flags">${flags}${checkmark}</span>`;
-        }
-
         const thumbHtml = isBlank
             ? `<div class="screenshot-thumb blank-thumb">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                     <rect x="3" y="3" width="18" height="18" rx="2"/>
                 </svg>
               </div>`
-            : `<img class="screenshot-thumb" src="${thumbSrc}" alt="${screenshot.name}">`;
+            : '<img class="screenshot-thumb">';
 
         item.innerHTML = `
             <div class="drag-handle">
@@ -6464,11 +6586,31 @@ function updateScreenshotList() {
             </div>
             ${thumbHtml}
             <div class="screenshot-info">
-                <div class="screenshot-name">${screenshot.name}</div>
-                <div class="screenshot-device">${isTransferTarget ? 'Click source to copy style' : screenshot.deviceType}${langFlagsHtml}</div>
+                <div class="screenshot-name"></div>
+                <div class="screenshot-device"></div>
             </div>
             ${buttonsHtml}
         `;
+        const thumbnail = item.querySelector('img.screenshot-thumb');
+        if (thumbnail) {
+            thumbnail.src = thumbSrc;
+            thumbnail.alt = screenshot.name || '';
+        }
+        item.querySelector('.screenshot-name').textContent = screenshot.name || '';
+        const device = item.querySelector('.screenshot-device');
+        device.textContent = isTransferTarget ? 'Click source to copy style' : (screenshot.deviceType || '');
+        if (state.projectLanguages.length > 1) {
+            const flags = document.createElement('span');
+            flags.className = 'screenshot-lang-flags';
+            flags.textContent = availableLangs.map(lang => languageFlags[lang] || '🏳️').join('');
+            if (isComplete) {
+                const checkmark = document.createElement('span');
+                checkmark.className = 'screenshot-complete';
+                checkmark.textContent = '✓';
+                flags.appendChild(checkmark);
+            }
+            device.appendChild(flags);
+        }
 
         // Drag and drop handlers
         item.addEventListener('dragstart', (e) => {
@@ -6867,8 +7009,8 @@ function updateGradientStopsUI() {
         const div = document.createElement('div');
         div.className = 'gradient-stop';
         div.innerHTML = `
-            <input type="color" value="${stop.color}" data-stop="${index}">
-            <input type="number" value="${stop.position}" min="0" max="100" data-stop="${index}">
+            <input type="color" data-stop="${index}">
+            <input type="number" min="0" max="100" data-stop="${index}">
             <span>%</span>
             ${index > 1 ? `<button class="screenshot-delete" data-stop="${index}">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -6876,6 +7018,8 @@ function updateGradientStopsUI() {
                 </svg>
             </button>` : ''}
         `;
+        div.querySelector('input[type="color"]').value = stop.color;
+        div.querySelector('input[type="number"]').value = stop.position;
 
         div.querySelector('input[type="color"]').addEventListener('input', (e) => {
             const currentBg = getBackground();
